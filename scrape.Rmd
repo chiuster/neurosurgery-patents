@@ -1,0 +1,212 @@
+---
+title: 'Neurosurgical Patents: Physicians vs. Non-Physicians'
+author: "Ryan G. Chiu"
+date: "5/27/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+#Import libraries
+library(foreign)
+library(readxl)
+library(dplyr)
+library(MASS)
+library(MatchIt)
+library(RColorBrewer)
+library(knitr)
+library(tableone)
+library(Matching)
+library(pastecs)
+library(stringr)
+library(epitools)
+library(elixhauser)
+library(jsonlite)
+library(rvest)
+library(RCurl)
+```
+
+``` {r, echo=FALSE}
+# Function definitions:
+get_stats <- function(vals) {
+  good_ones <- vals[!is.na(vals)]
+  return(c(length(good_ones), mean(good_ones), sd(good_ones)))
+}
+
+# Substitute non-English characters with equivalent English ones (NPI database won't support otherwise)
+to.plain <- function(s) {
+
+   # 1 character substitutions
+   old1 <- "šžþàáâãäåçèéêëìíîïðñòóôõöùúûüýŠŽÞÀÁÂÃÄÅÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖÙÚÛÜÝ"
+   new1 <- "szyaaaaaaceeeeiiiidnooooouuuuySZYAAAAAACEEEEIIIIDNOOOOOUUUUY"
+   s1 <- chartr(old1, new1, s)
+
+   # 2 character substitutions
+   old2 <- c("œ", "ß", "æ", "ø")
+   new2 <- c("oe", "ss", "ae", "oe")
+   s2 <- s1
+   for(i in seq_along(old2)) s2 <- gsub(old2[i], new2[i], s2, fixed = TRUE)
+
+   s2
+}
+
+# Extract number of citations given HTML of patent full-text webpage
+get_citations_from_html <- function(html) {
+  h2_vector <- html %>% html_nodes('h2') %>% html_text() %>% str_trim() %>% unlist()
+  citation_text_matches <- grep('Cited By \\(', h2_vector, value=TRUE)
+  
+  # Can't be too safe with this stuff -- always look for possibility of null values ;)
+  citation_text <- ifelse(length(citation_text_matches) > 0, citation_text_matches[1], 'Cited By (0)')
+  
+  # Now, let's get the number from the text ('Cited By (the_number_we_want)')
+  number_of_citations <- as.numeric(gsub("\\D", "", citation_text))
+  
+  number_of_citations
+}
+```
+
+Loading Google Patents output file ...
+```{r, echo=FALSE}
+# Load patents file
+setwd("/Users/Ryan/Downloads/")
+data <- read.csv("data22.csv", header=TRUE)
+```
+
+Convert inventors string to array of names, using comma as delimiter:
+```{r, echo=FALSE}
+inventors_list <- as.vector(data$inventors)
+i <- 0
+for (inventors in inventors_list) {
+  inventor_array <- str_split(inventors, ", ")
+  inventors_list[i] <- inventor_array
+  i <- i + 1
+}
+```
+
+We should now have a vector of vectors (array of arrays) for the inventors of each patents
+
+Now, we have to iterate through this updated vector and run each set of inventors through the NPI JSON database to identify neurosurgeon inventor presence. We will essentially need a nested for loop for this: 
+```{r}
+# This is the vector for our independent variable (i.e. is there a physician inventor aboard?) that will be applied as a column in our final dataframe
+is_neurosurgeon <- c()
+index <- 0
+
+for (inventors in inventors_list) {
+  physician_count <- 0
+  for (inventor in inventors) {
+    name <- str_split(inventor, " ")
+    json_string <- paste0("https://npiregistry.cms.hhs.gov/api/?version=2.1&taxonomy_description=Neurological%20Surgery&first_name=", to.plain(name[[1]][1]), "&last_name=", to.plain(name[[1]][length(name[[1]])]))
+
+    attempt <- 0
+    json <- NULL
+    while( is.null(json) && attempt <= 100) {
+      attempt <- attempt + 1
+      try(
+        json <- fromJSON(json_string)
+      )
+    } 
+    
+    if (!is.null(json$result_count) && json$result_count > 0) {
+      physician_count <- physician_count + 1
+    } else {
+      physician_count <- physician_count
+    }
+  }
+  
+  index <- index + 1
+  print(sprintf("Identifying neurosurgeons: %d of %d dataset rows processed ...", index, nrow(data)-1))
+  is_neurosurgeon <- c(is_neurosurgeon, physician_count)
+}
+```
+
+Okay, phew -- alright one more time, this time to identify the ORTHO BROS:
+```{r}
+is_orthopod <- c()
+index <- 0
+
+for (inventors in inventors_list) {
+  physician_count <- 0
+  for (inventor in inventors) {
+    name <- str_split(inventor, " ")
+    json_string <- paste0("https://npiregistry.cms.hhs.gov/api/?version=2.1&taxonomy_description=Orthopaedic%20Surgery&first_name=", to.plain(name[[1]][1]), "&last_name=", to.plain(name[[1]][length(name[[1]])]))
+    
+    attempt <- 0
+    json <- NULL
+    while( is.null(json) && attempt <= 100) {
+      attempt <- attempt + 1
+      try(
+        json <- fromJSON(json_string)
+      )
+    } 
+    
+    if (!is.null(json$result_count) && json$result_count > 0) {
+      physician_count <- physician_count + 1
+    } else {
+      physician_count <- physician_count
+    }
+  }
+  
+  index <- index + 1
+  print(sprintf("Identifying orthopaedic surgeons: %d of %d dataset rows processed ...", index, nrow(data)-1))
+  is_orthopod <- c(is_orthopod, physician_count)
+}
+```
+
+Okay, now let's scrape the full-text webpages (HTML) for number of citations. There should be a header called "Cited By" followed by a number in parentheses for granted patents
+
+HTML:
+<h2>Cited By (##)</h2>
+```{r}
+# Change this to data 1,2,3,4,5
+links <- as.vector(data$result_link)
+
+numbers_of_citations <- c()
+index <- 0
+
+for (link in links) {
+  n <- NULL
+  attempt <- 0
+  while( is.null(n) && attempt <= 100) {
+    attempt <- attempt + 1
+    try(
+      n <- get_citations_from_html(read_html(link))
+    )
+  } 
+  
+  numbers_of_citations <- c(numbers_of_citations, n)
+  index <- index + 1
+  
+  # ... and replace here too
+  print(sprintf("Retrieving number of citations: %d of %d dataset rows processed ...", index, nrow(data)-1))
+}
+```
+
+Now that we have bool vectors of calculated columns, let's append it onto our dataset as the last column:
+```{r}
+final_data <- cbind(data, data.frame(is_neurosurgeon), data.frame(is_orthopod), data.frame(numbers_of_citations))
+```
+
+Okay, now we can do data clean-up before starting stats:
+- is_neurosurgeon and is_orthopod are integer arrays -- 0 = no physician, 1+ = physician inventor present --> convert to boolean
+- in the data file, grant_date is blank if the patent wasn't granted --> let's make separate variable for this
+- application date and grant_date are formatted MM/DD/YY --> let's calculate new variable of "days till patent grant"
+- see if assignee is corporation vs. individual by business abbreviations such as "Inc" or "LLC" or "GmbH"
+```{r}
+final_data <- mutate(final_data, neurosurgeon_involved = ifelse(is_neurosurgeon > 0, "yes", "no"))
+final_data <- mutate(final_data, ortho_involved = ifelse(is_orthopod > 0, "yes", "no"))
+
+final_data <- mutate(final_data, granted = ifelse(nchar(as.character(grant_date)) > 0, "yes", "no"))
+
+final_data <- mutate(final_data, days_to_grant = ifelse(granted == "yes", as.Date(as.character(grant_date), format="%m/%d/%Y")-as.Date(as.character(filing_creation_date), format="%m/%d/%Y"), NA))
+
+final_data <- mutate(final_data, assignee_type = grepl("llc",tolower(assignee)) | grepl("lls",tolower(assignee)) | grepl("llp",tolower(assignee)) | grepl("inc",tolower(assignee)) | grepl("gmbh",tolower(assignee)) | grepl("corp",tolower(assignee)) | grepl("co.",tolower(assignee)))
+final_data <- mutate(final_data, assignee_type = ifelse(assignee_type, "corporation", "individual"))
+```
+
+Now, FINALLY we have all the variables we needed to run stats --> let's export to a new, clean CSV file
+``` {r}
+write.csv(final_data, 'patent_data_clean.csv')
+```
